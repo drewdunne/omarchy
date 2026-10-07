@@ -35,6 +35,15 @@ BarIndicator {
     }
   }
 
+  // Catches a recorder that exits on its own, such as when the microphone goes
+  // away, instead of showing a recording that is no longer running.
+  Timer {
+    interval: 5000
+    running: root.recording
+    repeat: true
+    onTriggered: root.refresh()
+  }
+
   onPressed: function() {
     if (root.bar) {
       root.bar.run(root.recording ? "omarchy-capture-voicerecording --stop-recording" : "omarchy-capture-voicerecording")
