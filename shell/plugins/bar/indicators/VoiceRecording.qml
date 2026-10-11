@@ -6,6 +6,9 @@ BarIndicator {
   id: root
 
   property bool recording: false
+  // A refresh asked for while a check is still running, such as the one a
+  // starting recording sends, must not be dropped: that check may predate it
+  property bool refreshPending: false
 
   active: recording
   activeText: "󰍰"
@@ -14,8 +17,11 @@ BarIndicator {
   inactiveTooltipText: "Voice Recording"
 
   function refresh() {
-    if (!root.bar || statusProc.running) return
-    statusProc.command = ["pgrep", "--quiet", "-f", "^omarchy-voicerecorder "]
+    if (!root.bar) return
+    if (statusProc.running) {
+      root.refreshPending = true
+      return
+    }
     statusProc.running = true
   }
 
@@ -28,10 +34,17 @@ BarIndicator {
     function onRefreshRequested() { root.refresh() }
   }
 
+  // Only this user's recorder, which runs as ffmpeg renamed to
+  // omarchy-voicerecorder
   Process {
     id: statusProc
+    command: ["bash", "-c", "pgrep --quiet -u \"$UID\" -f '^omarchy-voicerecorder '"]
     onExited: function(exitCode) {
       root.recording = exitCode === 0
+      if (root.refreshPending) {
+        root.refreshPending = false
+        Qt.callLater(root.refresh)
+      }
     }
   }
 
