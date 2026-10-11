@@ -48,12 +48,20 @@ esac
 SH
 
 # Stands in for every ffmpeg run. The capture (-f pulse) creates its output file
-# (the last argument) the way ffmpeg does once it has the microphone, unless it
-# stalls, and runs until signalled; a hanging one ignores the stop. The cleanup
-# can wait at a gate, can produce nothing, or can fail its loudness pass (-af)
-# the way loudnorm does on a clip too short or quiet to measure.
+# (the last argument) the way ffmpeg does once it has the microphone and runs
+# until signalled; a hanging one ignores the stop, and a stalling one never gets
+# the microphone and ignores TERM too. The cleanup can wait at a gate, can
+# produce nothing, or can fail its loudness pass (-af) the way loudnorm does on
+# a clip too short or quiet to measure. The decode check (-f null) passes what
+# the cleanup wrote.
 cat >"$stub_bin/ffmpeg" <<'SH'
 #!/bin/bash
+if [[ " $* " == *" -f null "* ]]; then
+  while (($#)) && [[ $1 != "-i" ]]; do shift; done
+  [[ -s $2 && $(<"$2") == @(processed|remuxed) ]]
+  exit
+fi
+
 if [[ " $* " != *" pulse "* ]]; then
   printf '%s\n' "$@" >"$OMARCHY_TEST_FINALIZE_ARGS"
   echo "finalize-begin" >>"$OMARCHY_TEST_ORDER"
@@ -79,7 +87,7 @@ fi
 printf '%s\n' "$@" >"$OMARCHY_TEST_FFMPEG_ARGS"
 echo $$ >"$OMARCHY_TEST_RECORDER_PID"
 echo "capture" >>"$OMARCHY_TEST_ORDER"
-if [[ ${OMARCHY_TEST_RECORDER:-} == "hangs" ]]; then
+if [[ ${OMARCHY_TEST_RECORDER:-} == @(hangs|stalls) ]]; then
   trap '' TERM
 else
   trap 'exit 0' TERM
@@ -88,16 +96,6 @@ fi
 while :; do
   sleep 0.1
 done
-SH
-
-# The cleanup output has audio when the cleanup stub wrote it
-cat >"$stub_bin/ffprobe" <<'SH'
-#!/bin/bash
-if [[ -s ${@: -1} && $(<"${@: -1}") == @(processed|remuxed) ]]; then
-  echo 1
-else
-  echo 0
-fi
 SH
 
 # Pins the timestamp in recording names when a test asks for it
@@ -154,6 +152,34 @@ voicerecording() {
 
 recorder_alive() {
   [[ -s $OMARCHY_TEST_RECORDER_PID ]] && kill -0 "$(<"$OMARCHY_TEST_RECORDER_PID")" 2>/dev/null
+}
+
+# Stands in for a recorder the stop signals; the path argument is only there so
+# the cleanup can find it
+start_fake_recorder() {
+  bash -c 'trap "exit 0" TERM; while :; do sleep 0.1; done' "$tmp_dir/fake-recorder" >/dev/null 2>&1 &
+  echo $! >"$OMARCHY_TEST_RECORDER_PID"
+}
+
+# True once a process descended from PID is blocked in flock
+waiting_at_lock() {
+  local waiter ancestor
+  for waiter in $("$real_pgrep" -x flock); do
+    ancestor=$waiter
+    while [[ -n $ancestor ]] && ((ancestor > 1)); do
+      ((ancestor == $1)) && return 0
+      ancestor=$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d ' ')
+    done
+  done
+  return 1
+}
+
+# Audio packets in FILE so far, 0 while there are none to count
+packets() {
+  local count
+  count=$("$real_ffprobe" -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null | head -n 1)
+  [[ $count =~ ^[0-9]+$ ]] || count=0
+  echo "$count"
 }
 
 wait_for_line() {
@@ -316,20 +342,46 @@ pass "a recording too short to measure is kept as recorded and saved"
 # ---------------------------------------------------------------- stalled start
 
 # Starting holds the lock, so a recorder that never gets the microphone must be
-# given up on, or nothing could stop it
+# given up on, or nothing could stop it. This one ignores TERM as well.
 reset_logs
 if OMARCHY_TEST_RECORDER=stalls voicerecording >/dev/null 2>&1; then
   fail "a recorder that never starts recording is a failed start"
 fi
-! recorder_alive || fail "a stalled recorder is ended"
+! recorder_alive || fail "a stalled recorder is ended, even one that ignores TERM"
 [[ ! -e $state_file ]] || fail "a stalled start leaves no state behind"
 grep -Fx "Voice recording failed to start" "$OMARCHY_TEST_NOTIFICATION_ARGS" >/dev/null ||
   fail "a stalled start says so" "$(cat "$OMARCHY_TEST_NOTIFICATION_ARGS")"
-if timeout 5 "$ROOT/bin/omarchy-capture-voicerecording" --stop-recording >/dev/null 2>&1; then
-  fail "a stop after a stalled start finds nothing recording"
-fi
-(($? != 124)) || fail "a stalled start releases the lock"
+status=0
+timeout 5 "$ROOT/bin/omarchy-capture-voicerecording" --stop-recording >/dev/null 2>&1 || status=$?
+((status == 1)) || fail "a stalled start releases the lock" "a stop afterwards exited $status"
 pass "a recorder that never starts recording is ended and the lock released"
+
+# ---------------------------------------------------------------- interrupted start
+
+# A start killed while it waits for the microphone takes its recorder with it,
+# rather than leaving one running that no state file points at
+reset_logs
+OMARCHY_TEST_RECORDER=stalls "$ROOT/bin/omarchy-capture-voicerecording" >/dev/null 2>&1 &
+launcher_pid=$!
+wait_for_line "capture" "$OMARCHY_TEST_ORDER" || fail "an interrupted start launches its recorder"
+kill -TERM "$launcher_pid"
+wait "$launcher_pid" 2>/dev/null || true
+! recorder_alive || fail "an interrupted start ends its recorder"
+[[ ! -e $state_file ]] || fail "an interrupted start leaves no state behind"
+pass "an interrupted start ends its recorder"
+
+# ---------------------------------------------------------------- lock failure
+
+# Without the lock, starts and stops could overlap, so refuse to run at all
+reset_logs
+rm -f "$XDG_RUNTIME_DIR/omarchy-voicerecord.lock"
+mkdir "$XDG_RUNTIME_DIR/omarchy-voicerecord.lock"
+if voicerecording >/dev/null 2>&1; then
+  fail "voice recording refuses to run without its lock"
+fi
+[[ ! -e $OMARCHY_TEST_FFMPEG_ARGS ]] || fail "voice recording starts nothing without its lock"
+rmdir "$XDG_RUNTIME_DIR/omarchy-voicerecord.lock"
+pass "voice recording refuses to run without its lock"
 
 # ---------------------------------------------------------------- overlap
 
@@ -347,7 +399,14 @@ wait_for_line "finalize-begin" "$OMARCHY_TEST_ORDER" || fail "the first recordin
 
 voicerecording >/dev/null 2>&1 &
 start_pid=$!
-if wait_for_line "capture" "$OMARCHY_TEST_ORDER"; then
+# Released only once the second start is provably queued behind the lock, so a
+# slow start can't pass by arriving late
+for _ in {1..100}; do
+  waiting_at_lock "$start_pid" && break
+  sleep 0.05
+done
+waiting_at_lock "$start_pid" || fail "a new recording waits at the lock while the last one is saved"
+if grep -qx "capture" "$OMARCHY_TEST_ORDER"; then
   fail "a new recording waits for the last one to finish saving" "$(cat "$OMARCHY_TEST_ORDER")"
 fi
 touch "$gate"
@@ -390,39 +449,46 @@ pass "every recorder lookup and signal is limited to this user's recorder"
 
 # ---------------------------------------------------------------- real audio
 
-# Hard-kill a real ffmpeg writing a synthetic tone with the recorder's fragment
-# settings, then stop it through the command with the real ffmpeg cleanup. No
-# microphone is involved.
+# The rest runs the real ffmpeg cleanup on synthetic audio written with the
+# recorder's fragment settings. No microphone is involved.
 eval "$(sed -n 's/^\(FRAGMENT_ARGS=(.*)\)$/\1/p' "$ROOT/bin/omarchy-capture-voicerecording")"
 ((${#FRAGMENT_ARGS[@]})) || fail "the recorder's fragment settings can be read"
-
-synthetic="$recording_dir/voicerecording-synthetic.m4a"
-"$real_ffmpeg" -nostdin -hide_banner -loglevel error -re -f lavfi -i "sine=frequency=440:sample_rate=48000" \
-  -c:a aac "${FRAGMENT_ARGS[@]}" "$synthetic" &
-synthetic_pid=$!
-sleep 3
-kill -9 "$synthetic_pid"
-wait "$synthetic_pid" 2>/dev/null || true
-
-killed_packets=$("$real_ffprobe" -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$synthetic")
-((killed_packets > 47)) ||
-  fail "a hard-killed recording still decodes, all but its last second" "packets: $killed_packets"
-pass "a hard-killed recording still decodes, all but its last second"
 
 real_bin="$tmp_dir/real-bin"
 mkdir -p "$real_bin"
 cp "$stub_bin"/{pgrep,pkill,omarchy-notification-send,omarchy-shell} "$real_bin/"
 
-# Stands in for the recorder that was killed: it goes when the stop signals it
-bash -c 'trap "exit 0" TERM; while :; do sleep 0.1; done' &
-echo $! >"$OMARCHY_TEST_RECORDER_PID"
-echo "$synthetic" >"$state_file"
-reset_logs
-PATH="$real_bin:$ROOT/bin:$original_path" voicerecording --stop-recording >/dev/null 2>&1 ||
-  fail "a hard-killed recording is cleaned up and saved" "$(cat "$OMARCHY_TEST_NOTIFICATION_ARGS" 2>/dev/null || true)"
+decodes_fully() {
+  "$real_ffmpeg" -nostdin -v error -xerror -i "$1" -map 0:a:0 -f null - >/dev/null 2>&1
+}
 
-saved_packets=$("$real_ffprobe" -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$synthetic")
-((saved_packets > 47)) || fail "the cleaned-up recording decodes" "packets: $saved_packets"
+# Stop the recording at FILE with the real ffmpeg cleanup
+stop_with_real_ffmpeg() {
+  start_fake_recorder
+  echo "$1" >"$state_file"
+  reset_logs
+  PATH="$real_bin:$ROOT/bin:$original_path" voicerecording --stop-recording >/dev/null 2>&1
+}
+
+# Hard-kill a real ffmpeg once two seconds of fragments are on disk
+synthetic="$recording_dir/voicerecording-synthetic.m4a"
+"$real_ffmpeg" -nostdin -hide_banner -loglevel error -re -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+  -c:a aac "${FRAGMENT_ARGS[@]}" "$synthetic" >/dev/null 2>&1 &
+synthetic_pid=$!
+for _ in {1..200}; do
+  (($(packets "$synthetic") >= 94)) && break
+  sleep 0.1
+done
+kill -9 "$synthetic_pid"
+wait "$synthetic_pid" 2>/dev/null || true
+
+(($(packets "$synthetic") >= 94)) && decodes_fully "$synthetic" ||
+  fail "a hard-killed recording still decodes, all but its last second" "packets: $(packets "$synthetic")"
+pass "a hard-killed recording still decodes, all but its last second"
+
+stop_with_real_ffmpeg "$synthetic" ||
+  fail "a hard-killed recording is cleaned up and saved" "$(cat "$OMARCHY_TEST_NOTIFICATION_ARGS" 2>/dev/null || true)"
+decodes_fully "$synthetic" && (($(packets "$synthetic") >= 94)) || fail "the cleaned-up recording decodes"
 ! LC_ALL=C grep -a -q moof "$synthetic" || fail "the cleaned-up recording is a regular .m4a, not fragments"
 grep -Fx "Voice recording saved" "$OMARCHY_TEST_NOTIFICATION_ARGS" >/dev/null ||
   fail "a cleaned-up hard-killed recording is announced as saved" "$(cat "$OMARCHY_TEST_NOTIFICATION_ARGS")"
@@ -433,16 +499,42 @@ pass "a hard-killed recording is cleaned up into a regular .m4a"
 quiet="$recording_dir/voicerecording-quiet.m4a"
 "$real_ffmpeg" -nostdin -hide_banner -loglevel error -f lavfi -i "anullsrc=r=48000:cl=stereo" -t 1 \
   -c:a aac "${FRAGMENT_ARGS[@]}" "$quiet"
-bash -c 'trap "exit 0" TERM; while :; do sleep 0.1; done' &
-echo $! >"$OMARCHY_TEST_RECORDER_PID"
-echo "$quiet" >"$state_file"
-reset_logs
-PATH="$real_bin:$ROOT/bin:$original_path" voicerecording --stop-recording >/dev/null 2>&1 ||
+stop_with_real_ffmpeg "$quiet" ||
   fail "a short silent recording is saved" "$(cat "$OMARCHY_TEST_NOTIFICATION_ARGS" 2>/dev/null || true)"
-quiet_packets=$("$real_ffprobe" -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$quiet")
-((quiet_packets > 0)) && ! LC_ALL=C grep -a -q moof "$quiet" ||
-  fail "a short silent recording is saved as a regular .m4a" "packets: $quiet_packets"
+decodes_fully "$quiet" && ! LC_ALL=C grep -a -q moof "$quiet" ||
+  fail "a short silent recording is saved as a regular .m4a"
 pass "a short silent recording, which loudnorm can't measure, is saved as a regular .m4a"
+
+# Audio damaged past its first packet still has its packets, so the rewrite
+# the quiet clip fell back on would succeed. It mustn't count as saved.
+damaged="$recording_dir/voicerecording-damaged.m4a"
+"$real_ffmpeg" -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 4 \
+  -c:a aac "${FRAGMENT_ARGS[@]}" "$damaged"
+python3 - "$damaged" <<'PY'
+import struct, sys
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+offset, first = 0, True
+while offset + 8 <= len(data):
+    size, kind = struct.unpack(">I4s", data[offset:offset + 8])
+    if size < 8:
+        break
+    if kind == b"mdat":
+        if not first:
+            data[offset + 8:offset + size] = bytes(size - 8)
+        first = False
+    offset += size
+open(path, "wb").write(data)
+PY
+cp "$damaged" "$tmp_dir/damaged-original"
+if stop_with_real_ffmpeg "$damaged"; then
+  fail "a damaged recording is not reported as saved" "$(cat "$OMARCHY_TEST_NOTIFICATION_ARGS")"
+fi
+cmp -s "$damaged" "$tmp_dir/damaged-original" || fail "a damaged recording is kept exactly as recorded"
+[[ $(ls -A "$recording_dir" | grep -c '^\.') == 0 ]] || fail "a damaged recording leaves no intermediate file" "$(ls -A "$recording_dir")"
+grep -Fx "Voice recording may be damaged" "$OMARCHY_TEST_NOTIFICATION_ARGS" >/dev/null ||
+  fail "a damaged recording is reported as possibly damaged" "$(cat "$OMARCHY_TEST_NOTIFICATION_ARGS")"
+pass "a damaged recording is kept as recorded and reported, not saved"
 
 # ---------------------------------------------------------------- leftovers
 
